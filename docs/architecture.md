@@ -18,12 +18,12 @@ flowchart LR
 ## Request flow
 
 1. `POST /v1/completions` accepts a prompt. `POST /v1/chat/completions` first renders its messages into a GPT-2 prompt.
-2. The handler tokenizes the prompt, creates the sampling and stopping state, and submits the request to the bounded queue.
+2. The handler tokenizes the prompt, creates the sampling configuration and textual stop filter, and submits the request to the bounded queue.
 3. The queue selects the highest-priority request; equal-priority requests retain arrival order.
 4. When a sequence slot is available, the scheduler allocates KV state and runs prompt prefill.
 5. The scheduler builds a decode batch with one current token from every active sequence and executes one model forward pass.
-6. Each sampled token updates its sequence state and is sent through that request's channel.
-7. Reaching a terminal condition or losing the receiver removes the sequence and returns its KV slot.
+6. Each sampled token updates its sequence state and is sent through that request's channel. The response filter holds possible stop prefixes, including matches inside BPE tokens, and signals the engine when a textual stop matches.
+7. Reaching a token limit, EOS, textual stop, shutdown, or disconnected receiver removes the sequence and returns its KV slot.
 
 ## Ownership and concurrency
 

@@ -6,11 +6,11 @@ pub mod sequence;
 
 pub use kv_cache::{KvCache, KvHandle, SlabKvCache};
 pub use model::{
-    DecodeBatch, DecodeInput, DecodeLogits, LogitRow, ModelOptions, SmallTransformer,
-    TokenizerBundle,
+    DecodeBatch, DecodeInput, DecodeLogits, LogitRow, ModelOptions, ScriptedTiming,
+    SmallTransformer, TokenizerBundle,
 };
 pub use sampler::{Sampler, SamplerConfig};
 pub use scheduler::{
     GenerationHandle, QueueFull, RequestQueue, Scheduler, SchedulerConfig, SchedulerMetrics,
 };
-pub use sequence::{GenerationRequest, Sequence, SequenceState, StreamItem};
+pub use sequence::{FinishReason, GenerationRequest, Sequence, SequenceState, StreamItem};

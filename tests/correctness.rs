@@ -1,44 +1,67 @@
 mod common;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+use hotbatch_core::TokenizerBundle;
 use hotbatch_server::ServeMode;
-use std::process::Command;
+use serde::Deserialize;
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fixed_prompt_matches_candle_reference_path() -> Result<()> {
-    let prompt = "The capital of France is";
-    let max_tokens = 64;
-    let seed = 42;
-    let reference = reference_generate(prompt, max_tokens, seed).await?;
-
-    let server = common::spawn(ServeMode::Continuous, max_tokens, 1_000).await?;
-    let base_url = format!("http://{}", server.addr);
-    let served = common::non_stream_completion(&base_url, prompt, max_tokens, seed).await?;
-    assert_eq!(served, reference);
-
-    server.stop().await
+#[derive(Debug, Deserialize)]
+struct GoldenFixture {
+    model: String,
+    revision: String,
+    weights_sha256: String,
+    generation: GoldenGeneration,
+    cases: Vec<GoldenCase>,
 }
 
-async fn reference_generate(prompt: &str, max_tokens: usize, seed: u64) -> Result<String> {
-    let model_name = std::env::var("HOTBATCH_TEST_MODEL").unwrap_or_else(|_| "gpt2".to_string());
-    let output = Command::new(assert_cmd::cargo::cargo_bin("candle-gpt2-reference"))
-        .args([
-            "--model",
-            &model_name,
-            "--prompt",
-            prompt,
-            "--max-tokens",
-            &max_tokens.to_string(),
-            "--seed",
-            &seed.to_string(),
-        ])
-        .output()
-        .context("running candle reference subprocess")?;
-    assert!(
-        output.status.success(),
-        "reference subprocess failed: status={:?}\nstderr={}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stderr)
+#[derive(Debug, Deserialize)]
+struct GoldenGeneration {
+    do_sample: bool,
+    temperature: f32,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoldenCase {
+    prompt: String,
+    prompt_token_ids: Vec<u32>,
+    max_new_tokens: usize,
+    expected_token_ids: Vec<u32>,
+    expected_text: String,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn greedy_gpt2_matches_hugging_face_golden_outputs() -> Result<()> {
+    let fixture: GoldenFixture = serde_json::from_str(include_str!("fixtures/gpt2-greedy.json"))?;
+    assert_eq!(fixture.model, "openai-community/gpt2");
+    assert_eq!(fixture.revision, "607a30d783dfa663caf39e06633721c8d4cfcd7e");
+    assert_eq!(
+        fixture.weights_sha256,
+        "248dfc3911869ec493c76e65bf2fcf7f615828b0254c12b473182f0f81d3a707"
     );
-    String::from_utf8(output.stdout).context("reference stdout was not utf-8")
+    assert!(!fixture.generation.do_sample);
+    assert_eq!(fixture.generation.temperature, 0.0);
+
+    let tokenizer = TokenizerBundle::load(&fixture.model).await?;
+    let max_tokens = fixture
+        .cases
+        .iter()
+        .map(|case| case.max_new_tokens)
+        .max()
+        .unwrap_or(1);
+    let server =
+        common::spawn_with_model(ServeMode::Continuous, max_tokens, fixture.model.clone()).await?;
+    let base_url = format!("http://{}", server.addr);
+
+    for case in fixture.cases {
+        assert_eq!(tokenizer.encode(&case.prompt)?, case.prompt_token_ids);
+        assert_eq!(
+            tokenizer.encode(&case.expected_text)?,
+            case.expected_token_ids
+        );
+        let served =
+            common::non_stream_completion(&base_url, &case.prompt, case.max_new_tokens, 42).await?;
+        assert_eq!(served, case.expected_text, "prompt: {}", case.prompt);
+    }
+
+    server.stop().await
 }

@@ -10,10 +10,15 @@ use std::time::Duration;
 
 static MODEL_LOAD_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-pub async fn spawn(
+pub async fn spawn(mode: ServeMode, max_tokens: usize) -> Result<RunningServer> {
+    let model = std::env::var("HOTBATCH_TEST_MODEL").unwrap_or_else(|_| "tiny-gpt2".to_string());
+    spawn_with_model(mode, max_tokens, model).await
+}
+
+pub async fn spawn_with_model(
     mode: ServeMode,
     max_tokens: usize,
-    forward_base_us: u64,
+    model: impl Into<String>,
 ) -> Result<RunningServer> {
     let _guard = MODEL_LOAD_LOCK.lock().await;
     let host =
@@ -22,14 +27,12 @@ pub async fn spawn(
         host,
         port: 0,
         mode,
-        model: std::env::var("HOTBATCH_TEST_MODEL").unwrap_or_else(|_| "gpt2".to_string()),
+        model: model.into(),
         device: "cpu".to_string(),
         max_running_seqs: 8,
         max_queue_depth: 128,
         max_seq_len: 256,
         max_new_tokens: max_tokens,
-        forward_base_us,
-        forward_per_seq_us: 50,
     })
     .await
 }
@@ -43,7 +46,6 @@ pub async fn non_stream_completion(
     let value: serde_json::Value = Client::new()
         .post(format!("{base_url}/v1/completions"))
         .json(&json!({
-            "model": "gpt2",
             "prompt": prompt,
             "max_tokens": max_tokens,
             "temperature": 0,
@@ -75,7 +77,6 @@ pub async fn collect_sse(
     let response = Client::new()
         .post(format!("{base_url}/v1/completions"))
         .json(&json!({
-            "model": "gpt2",
             "prompt": prompt,
             "max_tokens": max_tokens,
             "stream": true,
@@ -160,6 +161,23 @@ pub async fn wait_for_metric_at_least(base_url: &str, name: &str, target: f64) -
         if tokio::time::Instant::now() >= deadline {
             return Err(anyhow!(
                 "metric {name} did not reach {target}; last value={value}\n{body}"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+pub async fn wait_for_metric_at_most(base_url: &str, name: &str, target: f64) -> Result<f64> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let body = metrics(base_url).await?;
+        let value = metric_value(&body, name);
+        if value <= target {
+            return Ok(value);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(anyhow!(
+                "metric {name} did not fall to {target}; last value={value}\n{body}"
             ));
         }
         tokio::time::sleep(Duration::from_millis(25)).await;

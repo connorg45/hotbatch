@@ -1,6 +1,7 @@
+use crate::api::ApiError;
 use crate::AppState;
 use axum::extract::State;
-use axum::http::{header, StatusCode};
+use axum::http::header;
 use axum::response::{IntoResponse, Response};
 
 pub async fn metrics(State(state): State<AppState>) -> Response {
@@ -13,10 +14,6 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
             body,
         )
             .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to gather metrics: {err}"),
-        )
-            .into_response(),
+        Err(err) => ApiError::internal(format!("failed to gather metrics: {err}")).into_response(),
     }
 }

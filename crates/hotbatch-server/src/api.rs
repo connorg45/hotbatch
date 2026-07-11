@@ -1,17 +1,25 @@
-use crate::sse::{openai_stream, StreamKind};
+use crate::naive::NaiveSubmitError;
+use crate::sse::{openai_stream, FilterUpdate, StreamKind, TextOutputFilter};
 use crate::{AppState, Engine};
+use axum::extract::rejection::JsonRejection;
 use axum::extract::State;
-use axum::http::{header, StatusCode};
+use axum::http::StatusCode;
 use axum::response::sse::{KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use hotbatch_core::{GenerationHandle, GenerationRequest, SamplerConfig, StreamItem};
+use hotbatch_core::model::normalize_model_name;
+use hotbatch_core::{FinishReason, GenerationHandle, GenerationRequest, SamplerConfig, StreamItem};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+const DEFAULT_MAX_TOKENS: usize = 16;
+const MAX_STOP_SEQUENCES: usize = 4;
+const RESPONSE_CHANNEL_CAPACITY: usize = 32;
 
 #[derive(Debug, Deserialize)]
 pub struct CompletionRequest {
@@ -35,10 +43,20 @@ pub enum PromptField {
 }
 
 impl PromptField {
-    fn into_prompt(self) -> String {
+    fn into_single_prompt(self) -> Result<String, ApiError> {
         match self {
-            Self::String(prompt) => prompt,
-            Self::Strings(prompts) => prompts.join("\n"),
+            Self::String(prompt) => Ok(prompt),
+            Self::Strings(mut prompts) if prompts.len() == 1 => Ok(prompts.remove(0)),
+            Self::Strings(prompts) if prompts.is_empty() => Err(ApiError::invalid(
+                "prompt",
+                "prompt array must contain exactly one nonblank string",
+                "invalid_prompt",
+            )),
+            Self::Strings(_) => Err(ApiError::invalid(
+                "prompt",
+                "multiple prompts are not supported; provide a single prompt",
+                "multiple_prompts_not_supported",
+            )),
         }
     }
 }
@@ -79,11 +97,134 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ApiError {
+    #[serde(skip)]
+    status: StatusCode,
+    pub error: ApiErrorDetail,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ApiErrorDetail {
+    pub message: String,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub param: Option<String>,
+    pub code: &'static str,
+}
+
+impl ApiError {
+    fn new(
+        status: StatusCode,
+        message: impl Into<String>,
+        kind: &'static str,
+        param: Option<&str>,
+        code: &'static str,
+    ) -> Self {
+        Self {
+            status,
+            error: ApiErrorDetail {
+                message: message.into(),
+                kind,
+                param: param.map(ToOwned::to_owned),
+                code,
+            },
+        }
+    }
+
+    fn invalid(param: &'static str, message: impl Into<String>, code: &'static str) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            message,
+            "invalid_request_error",
+            Some(param),
+            code,
+        )
+    }
+
+    fn model_not_found(model: &str) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            format!("The model '{model}' does not exist or is not loaded"),
+            "invalid_request_error",
+            Some("model"),
+            "model_not_found",
+        )
+    }
+
+    fn queue_full() -> Self {
+        Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "request queue is full; retry later",
+            "rate_limit_error",
+            None,
+            "queue_full",
+        )
+    }
+
+    fn unavailable() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "generation scheduler is unavailable",
+            "server_error",
+            None,
+            "scheduler_unavailable",
+        )
+    }
+
+    pub(crate) fn generation(message: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            message,
+            "server_error",
+            None,
+            "generation_error",
+        )
+    }
+
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            message,
+            "server_error",
+            None,
+            "internal_error",
+        )
+    }
+
+    fn malformed_json(rejection: JsonRejection) -> Self {
+        let status = match rejection.status() {
+            StatusCode::PAYLOAD_TOO_LARGE => StatusCode::PAYLOAD_TOO_LARGE,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            _ => StatusCode::BAD_REQUEST,
+        };
+        Self::new(
+            status,
+            format!("Invalid JSON request: {}", rejection.body_text()),
+            "invalid_request_error",
+            None,
+            "invalid_json",
+        )
+    }
+
+    pub(crate) fn into_json_string(self) -> String {
+        serde_json::to_string(&self).unwrap_or_else(|_| {
+            "{\"error\":{\"message\":\"generation failed\",\"type\":\"server_error\",\"param\":null,\"code\":\"internal_error\"}}".to_string()
+        })
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (self.status, Json(self)).into_response()
+    }
+}
+
 pub async fn healthz(State(state): State<AppState>) -> Response {
     if state.alive.load(Ordering::SeqCst) {
         "ok".into_response()
     } else {
-        (StatusCode::SERVICE_UNAVAILABLE, "scheduler stopped").into_response()
+        ApiError::unavailable().into_response()
     }
 }
 
@@ -102,111 +243,150 @@ pub async fn models(State(state): State<AppState>) -> Response {
 
 pub async fn completions(
     State(state): State<AppState>,
-    Json(req): Json<CompletionRequest>,
+    payload: Result<Json<CompletionRequest>, JsonRejection>,
 ) -> Response {
-    let _requested_model = req.model.as_deref();
-    let prompt = req.prompt.into_prompt();
-    let max_tokens = req.max_tokens.unwrap_or(16).min(512);
-    let stream = req.stream.unwrap_or(false);
-    match submit_prompt(
-        &state,
-        SubmitParams {
-            prompt,
-            max_tokens,
-            channel_capacity: if stream {
-                32
-            } else {
-                max_tokens.saturating_add(4)
-            },
-            temperature: req.temperature.unwrap_or(0.0),
-            top_p: req.top_p.unwrap_or(1.0),
-            top_k: req.top_k,
-            stops: req.stop.map(StopField::into_vec).unwrap_or_default(),
-            seed: req.seed.unwrap_or(0),
-            priority: req.priority.unwrap_or(5),
-        },
-    )
-    .await
-    {
-        Ok((handle, prompt_tokens)) => {
-            if stream {
-                stream_response(
-                    format!("cmpl-{}", handle.id),
-                    handle,
-                    state.tokenizer.clone(),
-                    StreamKind::Completion,
-                )
-            } else {
-                collect_completion(format!("cmpl-{}", handle.id), handle, state, prompt_tokens)
-                    .await
-            }
+    let Json(req) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return ApiError::malformed_json(rejection).into_response(),
+    };
+
+    let prompt = match req.prompt.into_single_prompt() {
+        Ok(prompt) if !prompt.trim().is_empty() => prompt,
+        Ok(_) => {
+            return ApiError::invalid(
+                "prompt",
+                "prompt must be a nonblank string",
+                "invalid_prompt",
+            )
+            .into_response()
         }
-        Err(response) => response,
+        Err(error) => return error.into_response(),
+    };
+    let params = match validate_options(
+        &state,
+        req.model.as_deref(),
+        req.max_tokens,
+        req.temperature,
+        req.top_p,
+        req.top_k,
+        req.stop,
+        req.seed,
+        req.priority,
+    ) {
+        Ok(params) => params,
+        Err(error) => return error.into_response(),
+    };
+    let stream = req.stream.unwrap_or(false);
+
+    match submit_prompt(&state, prompt, params).await {
+        Ok((handle, _, stops)) if stream => stream_response(
+            format!("cmpl-{}", handle.id),
+            handle,
+            state.tokenizer.clone(),
+            state.model_name.clone(),
+            StreamKind::Completion,
+            stops,
+        ),
+        Ok((handle, prompt_tokens, stops)) => {
+            collect_completion(
+                format!("cmpl-{}", handle.id),
+                handle,
+                state,
+                prompt_tokens,
+                stops,
+            )
+            .await
+        }
+        Err(error) => error.into_response(),
     }
 }
 
 pub async fn chat_completions(
     State(state): State<AppState>,
-    Json(req): Json<ChatCompletionRequest>,
+    payload: Result<Json<ChatCompletionRequest>, JsonRejection>,
 ) -> Response {
-    let _requested_model = req.model.as_deref();
+    let Json(req) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return ApiError::malformed_json(rejection).into_response(),
+    };
+
+    if req.messages.is_empty() {
+        return ApiError::invalid(
+            "messages",
+            "messages must contain at least one message",
+            "invalid_messages",
+        )
+        .into_response();
+    }
+    for (index, message) in req.messages.iter().enumerate() {
+        if !matches!(message.role.as_str(), "system" | "user" | "assistant") {
+            return ApiError::invalid(
+                "messages",
+                format!("messages[{index}].role must be one of system, user, or assistant"),
+                "invalid_role",
+            )
+            .into_response();
+        }
+        if message.content.trim().is_empty() {
+            return ApiError::invalid(
+                "messages",
+                format!("messages[{index}].content must be nonblank"),
+                "invalid_message_content",
+            )
+            .into_response();
+        }
+    }
+
+    let params = match validate_options(
+        &state,
+        req.model.as_deref(),
+        req.max_tokens,
+        req.temperature,
+        req.top_p,
+        req.top_k,
+        req.stop,
+        req.seed,
+        req.priority,
+    ) {
+        Ok(params) => params,
+        Err(error) => return error.into_response(),
+    };
     let messages: Vec<hotbatch_core::model::ChatMessage> = req
         .messages
-        .iter()
+        .into_iter()
         .map(|message| hotbatch_core::model::ChatMessage {
-            role: message.role.clone(),
-            content: message.content.clone(),
+            role: message.role,
+            content: message.content,
         })
         .collect();
     let prompt = state.tokenizer.chat_template(&messages);
-    let max_tokens = req.max_tokens.unwrap_or(16).min(512);
     let stream = req.stream.unwrap_or(false);
-    match submit_prompt(
-        &state,
-        SubmitParams {
-            prompt,
-            max_tokens,
-            channel_capacity: if stream {
-                32
-            } else {
-                max_tokens.saturating_add(4)
-            },
-            temperature: req.temperature.unwrap_or(0.0),
-            top_p: req.top_p.unwrap_or(1.0),
-            top_k: req.top_k,
-            stops: req.stop.map(StopField::into_vec).unwrap_or_default(),
-            seed: req.seed.unwrap_or(0),
-            priority: req.priority.unwrap_or(5),
-        },
-    )
-    .await
-    {
-        Ok((handle, prompt_tokens)) => {
-            if stream {
-                stream_response(
-                    format!("chatcmpl-{}", handle.id),
-                    handle,
-                    state.tokenizer.clone(),
-                    StreamKind::Chat,
-                )
-            } else {
-                collect_chat_completion(
-                    format!("chatcmpl-{}", handle.id),
-                    handle,
-                    state,
-                    prompt_tokens,
-                )
-                .await
-            }
+
+    match submit_prompt(&state, prompt, params).await {
+        Ok((handle, _, stops)) if stream => stream_response(
+            format!("chatcmpl-{}", handle.id),
+            handle,
+            state.tokenizer.clone(),
+            state.model_name.clone(),
+            StreamKind::Chat,
+            stops,
+        ),
+        Ok((handle, prompt_tokens, stops)) => {
+            collect_chat_completion(
+                format!("chatcmpl-{}", handle.id),
+                handle,
+                state,
+                prompt_tokens,
+                stops,
+            )
+            .await
         }
-        Err(response) => response,
+        Err(error) => error.into_response(),
     }
 }
 
 struct SubmitParams {
-    prompt: String,
     max_tokens: usize,
-    channel_capacity: usize,
     temperature: f32,
     top_p: f32,
     top_k: Option<usize>,
@@ -215,20 +395,159 @@ struct SubmitParams {
     priority: u8,
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_options(
+    state: &AppState,
+    requested_model: Option<&str>,
+    max_tokens: Option<usize>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<usize>,
+    stop: Option<StopField>,
+    seed: Option<u64>,
+    priority: Option<u8>,
+) -> Result<SubmitParams, ApiError> {
+    if let Some(model) = requested_model {
+        if normalize_model_name(model).ok() != Some(state.model_name.as_str()) {
+            return Err(ApiError::model_not_found(model));
+        }
+    }
+
+    let max_tokens = max_tokens.unwrap_or(DEFAULT_MAX_TOKENS.min(state.max_new_tokens));
+    if max_tokens == 0 {
+        return Err(ApiError::invalid(
+            "max_tokens",
+            "max_tokens must be greater than zero",
+            "invalid_max_tokens",
+        ));
+    }
+    if max_tokens > state.max_new_tokens {
+        return Err(ApiError::invalid(
+            "max_tokens",
+            format!(
+                "max_tokens cannot exceed the configured limit of {}",
+                state.max_new_tokens
+            ),
+            "max_tokens_exceeded",
+        ));
+    }
+
+    let temperature = temperature.unwrap_or(0.0);
+    if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
+        return Err(ApiError::invalid(
+            "temperature",
+            "temperature must be finite and between 0 and 2",
+            "invalid_temperature",
+        ));
+    }
+
+    let top_p = top_p.unwrap_or(1.0);
+    if !(top_p.is_finite() && 0.0 < top_p && top_p <= 1.0) {
+        return Err(ApiError::invalid(
+            "top_p",
+            "top_p must be finite, greater than 0, and at most 1",
+            "invalid_top_p",
+        ));
+    }
+
+    if top_k == Some(0) {
+        return Err(ApiError::invalid(
+            "top_k",
+            "top_k must be greater than zero",
+            "invalid_top_k",
+        ));
+    }
+
+    let stops = match stop {
+        Some(stop) => {
+            let stops = stop.into_vec();
+            if stops.is_empty() {
+                return Err(ApiError::invalid(
+                    "stop",
+                    "stop must contain at least one sequence when provided",
+                    "invalid_stop",
+                ));
+            }
+            stops
+        }
+        None => Vec::new(),
+    };
+    if stops.len() > MAX_STOP_SEQUENCES {
+        return Err(ApiError::invalid(
+            "stop",
+            format!("stop supports at most {MAX_STOP_SEQUENCES} sequences"),
+            "too_many_stop_sequences",
+        ));
+    }
+    if stops.iter().any(|stop| stop.trim().is_empty()) {
+        return Err(ApiError::invalid(
+            "stop",
+            "stop sequences must be nonblank strings",
+            "invalid_stop",
+        ));
+    }
+
+    Ok(SubmitParams {
+        max_tokens,
+        temperature,
+        top_p,
+        top_k,
+        stops,
+        seed: seed.unwrap_or(0),
+        priority: priority.unwrap_or(5),
+    })
+}
+
 async fn submit_prompt(
     state: &AppState,
+    prompt: String,
     params: SubmitParams,
-) -> Result<(GenerationHandle, usize), Response> {
-    let prompt_tokens = state.tokenizer.encode(&params.prompt).map_err(|err| {
-        error_response(StatusCode::BAD_REQUEST, &format!("invalid prompt: {err}"))
+) -> Result<(GenerationHandle, usize, Vec<String>), ApiError> {
+    if !state.alive.load(Ordering::SeqCst) {
+        return Err(ApiError::unavailable());
+    }
+
+    let prompt_tokens = state.tokenizer.encode(&prompt).map_err(|error| {
+        ApiError::invalid(
+            "prompt",
+            format!("prompt could not be tokenized: {error}"),
+            "invalid_prompt",
+        )
     })?;
-    let stop_sequences = state
-        .tokenizer
-        .stop_sequences(&params.stops)
-        .map_err(|err| error_response(StatusCode::BAD_REQUEST, &format!("invalid stop: {err}")))?;
-    let (sender, receiver) = mpsc::channel(params.channel_capacity.max(32));
+    if prompt_tokens.is_empty() {
+        return Err(ApiError::invalid(
+            "prompt",
+            "prompt must produce at least one token",
+            "invalid_prompt",
+        ));
+    }
+    if prompt_tokens.len().saturating_add(params.max_tokens) > state.max_seq_len {
+        return Err(ApiError::invalid(
+            "max_tokens",
+            format!(
+                "prompt has {} tokens and max_tokens is {}; their sum exceeds the {}-token sequence limit",
+                prompt_tokens.len(),
+                params.max_tokens,
+                state.max_seq_len
+            ),
+            "context_length_exceeded",
+        ));
+    }
+
+    // A small bounded channel limits per-request buffering. The scheduler uses
+    // nonblocking sends and evicts a request if its consumer cannot keep up.
+    // Textual stop matching happens while the receiver drains this channel, so
+    // every sampled token remains visible even when a stop falls inside a BPE
+    // token or overlaps another stop sequence.
+    let output_capacity = params
+        .max_tokens
+        .checked_add(1)
+        .ok_or_else(|| ApiError::internal("response channel capacity overflow"))?;
+    let channel_capacity = output_capacity.clamp(2, RESPONSE_CHANNEL_CAPACITY);
+    let (sender, receiver) = mpsc::channel(channel_capacity);
     let id = Uuid::new_v4();
-    let req = GenerationRequest {
+    let response_done = CancellationToken::new();
+    let request = GenerationRequest {
         id,
         prompt_hash: hash_tokens(&prompt_tokens),
         prompt_tokens: prompt_tokens.clone(),
@@ -236,58 +555,143 @@ async fn submit_prompt(
             temperature: params.temperature,
             top_p: params.top_p,
             top_k: params.top_k,
-            stop_sequences,
-            max_new_tokens: params.max_tokens.max(1),
+            stop_sequences: Vec::new(),
+            max_new_tokens: params.max_tokens,
             eos_token: state.tokenizer.eos_token(),
             seed: params.seed,
         },
         sender,
         priority: params.priority,
         created_at: Instant::now(),
+        response_done: response_done.clone(),
     };
 
+    if !state.alive.load(Ordering::SeqCst) {
+        return Err(ApiError::unavailable());
+    }
     let handle = match &state.engine {
         Engine::Continuous { queue } => {
-            queue.submit(req).map_err(|_| {
-                error_response(StatusCode::TOO_MANY_REQUESTS, "request queue is full")
+            queue.submit(request).map_err(|_| {
+                if queue.is_closed() {
+                    ApiError::unavailable()
+                } else {
+                    ApiError::queue_full()
+                }
             })?;
-            GenerationHandle { id, receiver }
+            GenerationHandle {
+                id,
+                receiver,
+                response_done,
+            }
         }
         Engine::Naive(engine) => engine
-            .submit(req, receiver)
-            .map_err(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()))?,
+            .submit(request, receiver)
+            .map_err(|error| match error {
+                NaiveSubmitError::QueueFull => ApiError::queue_full(),
+                NaiveSubmitError::Unavailable => ApiError::unavailable(),
+            })?,
     };
 
-    Ok((handle, prompt_tokens.len()))
+    Ok((handle, prompt_tokens.len(), params.stops))
 }
 
 fn stream_response(
     id: String,
     handle: GenerationHandle,
     tokenizer: hotbatch_core::TokenizerBundle,
+    model: String,
     kind: StreamKind,
+    stops: Vec<String>,
 ) -> Response {
-    Sse::new(openai_stream(id, handle.receiver, tokenizer, kind))
-        .keep_alive(KeepAlive::default())
-        .into_response()
+    let GenerationHandle {
+        receiver,
+        response_done,
+        ..
+    } = handle;
+    Sse::new(openai_stream(
+        id,
+        receiver,
+        tokenizer,
+        model,
+        kind,
+        stops,
+        response_done,
+    ))
+    .keep_alive(KeepAlive::default())
+    .into_response()
+}
+
+struct CollectedGeneration {
+    text: String,
+    completion_tokens: usize,
+    reason: FinishReason,
+}
+
+async fn collect_generation(
+    mut handle: GenerationHandle,
+    tokenizer: &hotbatch_core::TokenizerBundle,
+    stops: Vec<String>,
+) -> Result<CollectedGeneration, ApiError> {
+    let mut tokens = Vec::new();
+    let mut text = String::new();
+    let mut output = TextOutputFilter::new(stops);
+    loop {
+        match handle.receiver.recv().await {
+            Some(StreamItem::Token(token)) => {
+                tokens.push(token);
+                let decoded = tokenizer.decode(&tokens).map_err(|error| {
+                    ApiError::generation(format!("generated tokens could not be decoded: {error}"))
+                })?;
+                let stable = decoded.trim_end_matches('\u{fffd}');
+                match output.push(stable).map_err(ApiError::generation)? {
+                    FilterUpdate::Continue(fragment) => text.push_str(&fragment),
+                    FilterUpdate::Stop(fragment) => {
+                        text.push_str(&fragment);
+                        handle.stop_generation();
+                        return Ok(CollectedGeneration {
+                            text,
+                            completion_tokens: tokens.len(),
+                            reason: FinishReason::Stop,
+                        });
+                    }
+                }
+            }
+            Some(StreamItem::Finished(reason)) => {
+                let decoded = tokenizer.decode(&tokens).map_err(|error| {
+                    ApiError::generation(format!("generated tokens could not be decoded: {error}"))
+                })?;
+                let remaining = output.finish(&decoded).map_err(ApiError::generation)?;
+                text.push_str(&remaining);
+                return Ok(CollectedGeneration {
+                    text,
+                    completion_tokens: tokens.len(),
+                    reason,
+                });
+            }
+            Some(StreamItem::Error(message)) => {
+                return Err(ApiError::generation(format!(
+                    "generation failed: {message}"
+                )))
+            }
+            None => {
+                return Err(ApiError::generation(
+                    "generation ended before a terminal event",
+                ))
+            }
+        }
+    }
 }
 
 async fn collect_completion(
     id: String,
-    mut handle: GenerationHandle,
+    handle: GenerationHandle,
     state: AppState,
     prompt_tokens: usize,
+    stops: Vec<String>,
 ) -> Response {
-    let mut tokens = Vec::new();
-    while let Some(item) = handle.receiver.recv().await {
-        match item {
-            StreamItem::Token(token) => tokens.push(token),
-            StreamItem::Done => break,
-        }
-    }
-    let text = match state.tokenizer.decode(&tokens) {
-        Ok(text) => text,
-        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    let generation = match collect_generation(handle, &state.tokenizer, stops).await {
+        Ok(result) => result,
+        Err(error) => return error.into_response(),
     };
     Json(json!({
         "id": id,
@@ -295,13 +699,13 @@ async fn collect_completion(
         "model": state.model_name,
         "choices": [{
             "index": 0,
-            "text": text,
-            "finish_reason": "stop"
+            "text": generation.text,
+            "finish_reason": finish_reason_label(generation.reason)
         }],
         "usage": {
             "prompt_tokens": prompt_tokens,
-            "completion_tokens": tokens.len(),
-            "total_tokens": prompt_tokens + tokens.len()
+            "completion_tokens": generation.completion_tokens,
+            "total_tokens": prompt_tokens + generation.completion_tokens
         }
     }))
     .into_response()
@@ -309,20 +713,14 @@ async fn collect_completion(
 
 async fn collect_chat_completion(
     id: String,
-    mut handle: GenerationHandle,
+    handle: GenerationHandle,
     state: AppState,
     prompt_tokens: usize,
+    stops: Vec<String>,
 ) -> Response {
-    let mut tokens = Vec::new();
-    while let Some(item) = handle.receiver.recv().await {
-        match item {
-            StreamItem::Token(token) => tokens.push(token),
-            StreamItem::Done => break,
-        }
-    }
-    let text = match state.tokenizer.decode(&tokens) {
-        Ok(text) => text,
-        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    let generation = match collect_generation(handle, &state.tokenizer, stops).await {
+        Ok(result) => result,
+        Err(error) => return error.into_response(),
     };
     Json(json!({
         "id": id,
@@ -332,32 +730,24 @@ async fn collect_chat_completion(
             "index": 0,
             "message": {
                 "role": "assistant",
-                "content": text
+                "content": generation.text
             },
-            "finish_reason": "stop"
+            "finish_reason": finish_reason_label(generation.reason)
         }],
         "usage": {
             "prompt_tokens": prompt_tokens,
-            "completion_tokens": tokens.len(),
-            "total_tokens": prompt_tokens + tokens.len()
+            "completion_tokens": generation.completion_tokens,
+            "total_tokens": prompt_tokens + generation.completion_tokens
         }
     }))
     .into_response()
 }
 
-fn error_response(status: StatusCode, message: &str) -> Response {
-    (
-        status,
-        [(header::CONTENT_TYPE, "application/json")],
-        Json(json!({
-            "error": {
-                "message": message,
-                "type": "hotbatch_error",
-                "code": status.as_u16()
-            }
-        })),
-    )
-        .into_response()
+pub(crate) fn finish_reason_label(reason: FinishReason) -> &'static str {
+    match reason {
+        FinishReason::Length => "length",
+        FinishReason::Stop => "stop",
+    }
 }
 
 fn hash_tokens(tokens: &[u32]) -> u64 {

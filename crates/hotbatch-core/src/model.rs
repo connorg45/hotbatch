@@ -10,10 +10,23 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokenizers::Tokenizer;
 
+pub const GPT2_REVISION: &str = "607a30d783dfa663caf39e06633721c8d4cfcd7e";
+const TINY_GPT2_REVISION: &str = "71034c5d8bde858ff824298bdedc65515b97d2b9";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelOptions {
     pub model: String,
     pub device: String,
+    #[serde(default)]
+    pub scripted_timing: ScriptedTiming,
+}
+
+/// Optional timing controls for the deterministic scripted test backend.
+///
+/// GPT-2 backends never consult these values, so production and benchmark
+/// latency always reflects model execution rather than synthetic sleeps.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ScriptedTiming {
     pub forward_base_us: u64,
     pub forward_per_seq_us: u64,
     pub prefill_per_token_us: u64,
@@ -24,9 +37,7 @@ impl Default for ModelOptions {
         Self {
             model: "gpt2".to_string(),
             device: "cpu".to_string(),
-            forward_base_us: 1_200,
-            forward_per_seq_us: 130,
-            prefill_per_token_us: 50,
+            scripted_timing: ScriptedTiming::default(),
         }
     }
 }
@@ -112,43 +123,42 @@ pub struct TokenizerBundle {
 
 impl TokenizerBundle {
     pub async fn load(model: &str) -> Result<Self> {
-        let model_name = normalize_model_name(model);
+        let model_name = normalize_model_name(model)?;
+        Self::load_normalized(model_name).await
+    }
+
+    async fn load_normalized(model_name: &str) -> Result<Self> {
+        if model_name == "scripted" {
+            let fallback = FallbackTokenizer::new();
+            return Ok(Self {
+                tokenizer: None,
+                fallback: Arc::new(fallback),
+                model_name: model_name.to_string(),
+                eos_token: 0,
+                vocab_size: 512,
+            });
+        }
+
         let downloaded = tokio::task::spawn_blocking({
-            let model_name = model_name.clone();
+            let model_name = model_name.to_string();
             move || download_tokenizer(&model_name)
         })
         .await
-        .context("tokenizer download task failed")?;
-
-        match downloaded {
-            Ok(path) => {
-                let tokenizer = Tokenizer::from_file(&path)
-                    .map_err(|err| anyhow!("failed to load tokenizer {}: {err}", path.display()))?;
-                let vocab_size = tokenizer.get_vocab_size(false);
-                let eos_token = tokenizer
-                    .token_to_id("<|endoftext|>")
-                    .or_else(|| tokenizer.token_to_id("</s>"))
-                    .unwrap_or(50_256);
-                Ok(Self {
-                    tokenizer: Some(Arc::new(tokenizer)),
-                    fallback: Arc::new(FallbackTokenizer::new()),
-                    model_name,
-                    eos_token,
-                    vocab_size,
-                })
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, "falling back to byte tokenizer; hf-hub tokenizer download failed");
-                let fallback = FallbackTokenizer::new();
-                Ok(Self {
-                    tokenizer: None,
-                    fallback: Arc::new(fallback),
-                    model_name,
-                    eos_token: 0,
-                    vocab_size: 512,
-                })
-            }
-        }
+        .context("tokenizer download task failed")??;
+        let tokenizer = Tokenizer::from_file(&downloaded)
+            .map_err(|err| anyhow!("failed to load tokenizer {}: {err}", downloaded.display()))?;
+        let vocab_size = tokenizer.get_vocab_size(false);
+        let eos_token = tokenizer
+            .token_to_id("<|endoftext|>")
+            .or_else(|| tokenizer.token_to_id("</s>"))
+            .unwrap_or(50_256);
+        Ok(Self {
+            tokenizer: Some(Arc::new(tokenizer)),
+            fallback: Arc::new(FallbackTokenizer::new()),
+            model_name: model_name.to_string(),
+            eos_token,
+            vocab_size,
+        })
     }
 
     pub fn model_name(&self) -> &str {
@@ -186,41 +196,16 @@ impl TokenizerBundle {
         self.decode(&[token]).unwrap_or_else(|_| String::new())
     }
 
-    pub fn stop_sequences(&self, stops: &[String]) -> Result<Vec<Vec<u32>>> {
-        let mut encoded = Vec::with_capacity(stops.len());
-        for stop in stops {
-            let ids = self.encode(stop)?;
-            if !ids.is_empty() {
-                encoded.push(ids);
-            }
-        }
-        Ok(encoded)
-    }
-
     pub fn chat_template(&self, messages: &[ChatMessage]) -> String {
-        if self.model_name == "tinyllama" {
-            let mut rendered = String::new();
-            for message in messages {
-                let role = message.role.as_str();
-                rendered.push_str("<|");
-                rendered.push_str(role);
-                rendered.push_str("|>\n");
-                rendered.push_str(&message.content);
-                rendered.push('\n');
-            }
-            rendered.push_str("<|assistant|>\n");
-            rendered
-        } else {
-            let mut rendered = String::new();
-            for message in messages {
-                rendered.push_str(&message.role);
-                rendered.push_str(": ");
-                rendered.push_str(&message.content);
-                rendered.push('\n');
-            }
-            rendered.push_str("assistant: ");
-            rendered
+        let mut rendered = String::new();
+        for message in messages {
+            rendered.push_str(&message.role);
+            rendered.push_str(": ");
+            rendered.push_str(&message.content);
+            rendered.push('\n');
         }
+        rendered.push_str("assistant: ");
+        rendered
     }
 }
 
@@ -244,21 +229,20 @@ enum ModelBackend {
 
 impl SmallTransformer {
     pub async fn load(options: ModelOptions) -> Result<Self> {
-        let tokenizer = TokenizerBundle::load(&options.model).await?;
+        let model_name = normalize_model_name(&options.model)?;
         let device = candle_device(&options.device)?;
-        let backend = match tokenizer.model_name() {
+        let tokenizer = TokenizerBundle::load_normalized(model_name).await?;
+        let backend = match model_name {
             "gpt2" | "tiny-gpt2" => {
                 let files = tokio::task::spawn_blocking({
-                    let model_name = tokenizer.model_name().to_string();
+                    let model_name = model_name.to_string();
                     move || download_gpt2_files(&model_name)
                 })
                 .await
                 .context("model download task failed")??;
-                ModelBackend::Gpt2(Box::new(Gpt2Model::load(files, device, options.clone())?))
+                ModelBackend::Gpt2(Box::new(Gpt2Model::load(files, device)?))
             }
-            "scripted" | "tinyllama" => {
-                ModelBackend::Scripted(ScriptedModel::new(tokenizer.clone(), options)?)
-            }
+            "scripted" => ModelBackend::Scripted(ScriptedModel::new(tokenizer.clone(), options)?),
             other => return Err(anyhow!("unsupported model '{other}'")),
         };
         Ok(Self { tokenizer, backend })
@@ -277,12 +261,26 @@ impl SmallTransformer {
         }
     }
 
+    pub fn max_positions(&self) -> usize {
+        match &self.backend {
+            ModelBackend::Gpt2(model) => model.config.max_positions(),
+            ModelBackend::Scripted(model) => model.max_positions(),
+        }
+    }
+
     pub fn prefill(
         &mut self,
         prompt_tokens: &[u32],
         handle: &KvHandle,
         kv_cache: &mut dyn KvCache,
     ) -> Result<()> {
+        if prompt_tokens.len() > self.max_positions() {
+            return Err(anyhow!(
+                "prompt length {} exceeds model capacity {}",
+                prompt_tokens.len(),
+                self.max_positions()
+            ));
+        }
         match &mut self.backend {
             ModelBackend::Gpt2(model) => model.prefill(prompt_tokens, handle, kv_cache),
             ModelBackend::Scripted(model) => model.prefill(prompt_tokens, handle, kv_cache),
@@ -294,6 +292,19 @@ impl SmallTransformer {
         batch: &DecodeBatch,
         kv_cache: &mut dyn KvCache,
     ) -> Result<DecodeLogits> {
+        let max_positions = self.max_positions();
+        if let Some(input) = batch
+            .rows()
+            .iter()
+            .find(|input| input.position >= max_positions)
+        {
+            return Err(anyhow!(
+                "decode position {} exceeds model capacity {} for sequence {}",
+                input.position,
+                max_positions,
+                input.seq_id
+            ));
+        }
         match &mut self.backend {
             ModelBackend::Gpt2(model) => model.forward(batch, kv_cache),
             ModelBackend::Scripted(model) => model.forward(batch, kv_cache),
@@ -304,24 +315,20 @@ impl SmallTransformer {
 #[derive(Debug)]
 struct ScriptedModel {
     tokenizer: TokenizerBundle,
-    options: ModelOptions,
+    timing: ScriptedTiming,
     script_tokens: Vec<u32>,
 }
 
 impl ScriptedModel {
     fn new(tokenizer: TokenizerBundle, options: ModelOptions) -> Result<Self> {
-        let script = if tokenizer.model_name() == "tinyllama" {
-            " A concise, deterministic response keeps the result useful."
-        } else {
-            " France, known for Paris, art, science, and careful engineering."
-        };
+        let script = " France, known for Paris, art, science, and careful engineering.";
         let mut script_tokens = tokenizer.encode(script)?;
         if script_tokens.is_empty() {
             script_tokens.push(tokenizer.eos_token());
         }
         Ok(Self {
             tokenizer,
-            options,
+            timing: options.scripted_timing,
             script_tokens,
         })
     }
@@ -330,14 +337,23 @@ impl ScriptedModel {
         (12, 12, 64)
     }
 
+    fn max_positions(&self) -> usize {
+        1024
+    }
+
     fn prefill(
         &mut self,
         prompt_tokens: &[u32],
         handle: &KvHandle,
         kv_cache: &mut dyn KvCache,
     ) -> Result<()> {
+        #[cfg(test)]
+        if prompt_tokens == [u32::MAX] {
+            return Err(anyhow!("scripted prefill failure"));
+        }
+
         let sleep_us = self
-            .options
+            .timing
             .prefill_per_token_us
             .saturating_mul(prompt_tokens.len() as u64);
         if sleep_us > 0 {
@@ -352,8 +368,8 @@ impl ScriptedModel {
 
     fn forward(&mut self, batch: &DecodeBatch, kv_cache: &mut dyn KvCache) -> Result<DecodeLogits> {
         let batch_size = batch.dim(0);
-        let sleep_us = self.options.forward_base_us.saturating_add(
-            self.options
+        let sleep_us = self.timing.forward_base_us.saturating_add(
+            self.timing
                 .forward_per_seq_us
                 .saturating_mul(batch_size as u64),
         );
@@ -419,7 +435,6 @@ impl Gpt2Config {
 struct Gpt2Model {
     config: Gpt2Config,
     head_dim: usize,
-    options: ModelOptions,
     wte: Embedding,
     wpe: Embedding,
     blocks: Vec<Gpt2Block>,
@@ -428,12 +443,27 @@ struct Gpt2Model {
 }
 
 impl Gpt2Model {
-    fn load(files: Gpt2Files, device: Device, options: ModelOptions) -> Result<Self> {
+    fn load(files: Gpt2Files, device: Device) -> Result<Self> {
         let config_bytes = fs::read(&files.config)
             .with_context(|| format!("reading GPT-2 config {}", files.config.display()))?;
         let config: Gpt2Config =
             serde_json::from_slice(&config_bytes).context("parsing GPT-2 config")?;
-        if config.n_embd % config.n_head != 0 {
+        if config.vocab_size == 0
+            || config.n_embd == 0
+            || config.n_layer == 0
+            || config.n_head == 0
+            || config.max_positions() == 0
+        {
+            return Err(anyhow!(
+                "invalid GPT-2 config: vocab_size={}, n_embd={}, n_layer={}, n_head={}, max_positions={}",
+                config.vocab_size,
+                config.n_embd,
+                config.n_layer,
+                config.n_head,
+                config.max_positions()
+            ));
+        }
+        if !config.n_embd.is_multiple_of(config.n_head) {
             return Err(anyhow!(
                 "invalid GPT-2 config: n_embd={} is not divisible by n_head={}",
                 config.n_embd,
@@ -468,7 +498,6 @@ impl Gpt2Model {
         Ok(Self {
             config,
             head_dim,
-            options,
             wte,
             wpe,
             blocks,
@@ -487,13 +516,6 @@ impl Gpt2Model {
         if cached_len == 0 {
             return Ok(());
         }
-        let sleep_us = self
-            .options
-            .prefill_per_token_us
-            .saturating_mul(cached_len as u64);
-        if sleep_us > 0 {
-            std::thread::sleep(Duration::from_micros(sleep_us));
-        }
         let tokens = vec![prompt_tokens[..cached_len].to_vec()];
         let positions = vec![(0..cached_len as u32).collect::<Vec<u32>>()];
         let input_ids = Tensor::new(tokens, &self.device)?;
@@ -511,14 +533,6 @@ impl Gpt2Model {
     fn forward(&mut self, batch: &DecodeBatch, kv_cache: &mut dyn KvCache) -> Result<DecodeLogits> {
         if batch.rows().is_empty() {
             return Ok(DecodeLogits { rows: Vec::new() });
-        }
-        let sleep_us = self.options.forward_base_us.saturating_add(
-            self.options
-                .forward_per_seq_us
-                .saturating_mul(batch.dim(0) as u64),
-        );
-        if sleep_us > 0 {
-            std::thread::sleep(Duration::from_micros(sleep_us));
         }
         let token_rows: Vec<Vec<u32>> = batch
             .rows()
@@ -881,67 +895,104 @@ struct Gpt2Files {
 fn candle_device(requested: &str) -> Result<Device> {
     match requested {
         "cpu" => Ok(Device::Cpu),
-        "cuda" => {
-            #[cfg(feature = "cuda")]
-            {
-                Device::new_cuda(0).context("creating CUDA device")
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                Err(anyhow!(
-                    "--device cuda was requested, but this build was compiled without the cuda feature"
-                ))
-            }
-        }
+        other => Err(anyhow!("unsupported device '{other}', expected cpu")),
+    }
+}
+
+pub fn normalize_model_name(model: &str) -> Result<&'static str> {
+    match model {
+        "gpt2" | "openai-community/gpt2" => Ok("gpt2"),
+        "tiny-gpt2"
+        | "tiny-random-gpt2"
+        | "sshleifer/tiny-gpt2"
+        | "hf-internal-testing/tiny-random-gpt2" => Ok("tiny-gpt2"),
+        "scripted" => Ok("scripted"),
         other => Err(anyhow!(
-            "unsupported device '{other}', expected cpu or cuda"
+            "unsupported model '{other}'; expected gpt2, openai-community/gpt2, or a tiny GPT-2 alias"
         )),
     }
 }
 
-fn normalize_model_name(model: &str) -> String {
-    match model {
-        "TinyLlama-1.1B-Chat" | "TinyLlama/TinyLlama-1.1B-Chat-v1.0" | "tinyllama" => {
-            "tinyllama".to_string()
-        }
-        "sshleifer/tiny-gpt2" | "tiny-gpt2" => "tiny-gpt2".to_string(),
-        "scripted" => "scripted".to_string(),
-        _ => "gpt2".to_string(),
-    }
-}
-
-fn hf_repo(model_name: &str) -> (&'static str, &'static str) {
+fn hf_repo(model_name: &str) -> Result<(&'static str, &'static str, &'static str)> {
     match model_name {
-        "tiny-gpt2" => ("hf-internal-testing", "tiny-random-gpt2"),
-        "tinyllama" => ("TinyLlama", "TinyLlama-1.1B-Chat-v1.0"),
-        _ => ("openai-community", "gpt2"),
+        "gpt2" => Ok(("openai-community", "gpt2", GPT2_REVISION)),
+        "tiny-gpt2" => Ok((
+            "hf-internal-testing",
+            "tiny-random-gpt2",
+            TINY_GPT2_REVISION,
+        )),
+        other => Err(anyhow!("no Hugging Face repository for model '{other}'")),
     }
 }
 
 fn download_tokenizer(model_name: &str) -> Result<PathBuf> {
     let client = HFClientSync::new().context("creating hf-hub client")?;
-    let (owner, repo) = hf_repo(model_name);
+    let (owner, repo, revision) = hf_repo(model_name)?;
     client
         .model(owner, repo)
         .download_file()
         .filename("tokenizer.json")
+        .revision(revision)
         .send()
-        .with_context(|| format!("downloading tokenizer for {owner}/{repo}"))
+        .with_context(|| format!("downloading tokenizer for {owner}/{repo}@{revision}"))
 }
 
 fn download_gpt2_files(model_name: &str) -> Result<Gpt2Files> {
     let client = HFClientSync::new().context("creating hf-hub client")?;
-    let (owner, repo) = hf_repo(model_name);
+    let (owner, repo, revision) = hf_repo(model_name)?;
     let model = client.model(owner, repo);
     let config = model
         .download_file()
         .filename("config.json")
+        .revision(revision)
         .send()
-        .with_context(|| format!("downloading config for {owner}/{repo}"))?;
+        .with_context(|| format!("downloading config for {owner}/{repo}@{revision}"))?;
     let weights = model
         .download_file()
         .filename("model.safetensors")
+        .revision(revision)
         .send()
-        .with_context(|| format!("downloading model.safetensors for {owner}/{repo}"))?;
+        .with_context(|| format!("downloading model.safetensors for {owner}/{repo}@{revision}"))?;
     Ok(Gpt2Files { config, weights })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_supported_gpt2_names() {
+        for name in ["gpt2", "openai-community/gpt2"] {
+            assert_eq!(normalize_model_name(name).unwrap(), "gpt2");
+        }
+        for name in [
+            "tiny-gpt2",
+            "tiny-random-gpt2",
+            "sshleifer/tiny-gpt2",
+            "hf-internal-testing/tiny-random-gpt2",
+        ] {
+            assert_eq!(normalize_model_name(name).unwrap(), "tiny-gpt2");
+        }
+        assert_eq!(normalize_model_name("scripted").unwrap(), "scripted");
+    }
+
+    #[test]
+    fn rejects_unknown_models_and_non_cpu_devices() {
+        assert!(normalize_model_name("unknown/model").is_err());
+        assert!(candle_device("cuda").is_err());
+        assert!(candle_device("metal").is_err());
+        assert!(candle_device("cpu").is_ok());
+    }
+
+    #[tokio::test]
+    async fn scripted_tokenizer_uses_offline_fallback() {
+        let tokenizer = TokenizerBundle::load("scripted").await.unwrap();
+        assert_eq!(tokenizer.model_name(), "scripted");
+        assert_eq!(
+            tokenizer
+                .decode(&tokenizer.encode("hello").unwrap())
+                .unwrap(),
+            "hello"
+        );
+    }
 }

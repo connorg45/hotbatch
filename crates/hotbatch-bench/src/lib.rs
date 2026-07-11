@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context, Result};
+use bytes::{Buf, BytesMut};
 use clap::Args;
 use futures_util::StreamExt;
 use hotbatch_server::{ServeArgs, ServeMode};
@@ -8,7 +9,7 @@ use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::Barrier;
 
 #[derive(Debug, Clone, Args)]
@@ -39,6 +40,9 @@ struct RequestStats {
     inter_token_ms: Vec<f64>,
 }
 
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+
 pub async fn run(args: BenchArgs) -> Result<()> {
     fs::create_dir_all(&args.output_dir)
         .with_context(|| format!("creating {}", args.output_dir.display()))?;
@@ -63,14 +67,22 @@ pub async fn run(args: BenchArgs) -> Result<()> {
             max_queue_depth: 2048,
             max_seq_len: 512,
             max_new_tokens: max_tokens,
-            forward_base_us: 1_200,
-            forward_per_seq_us: 130,
         })
         .await?;
         let base_url = format!("http://{}", server.addr);
-        warmup(&base_url, prompt, max_tokens).await?;
+        let client = bench_client()?;
+        warmup(&client, &base_url, &args.model, prompt, max_tokens).await?;
         for concurrency in &concurrencies {
-            let result = run_concurrency(&base_url, mode, *concurrency, prompt, max_tokens).await?;
+            let result = run_concurrency(
+                &client,
+                &base_url,
+                &args.model,
+                mode,
+                *concurrency,
+                prompt,
+                max_tokens,
+            )
+            .await?;
             println!(
                 "{:?}\tconcurrency={}\ttok/s={:.2}\tft p50/p95={:.2}/{:.2}ms\tit p50/p95={:.2}/{:.2}ms",
                 result.mode,
@@ -86,35 +98,58 @@ pub async fn run(args: BenchArgs) -> Result<()> {
         server.stop().await?;
     }
 
-    write_markdown(&args.output_dir, prompt, max_tokens, &results)?;
+    write_markdown(&args.output_dir, &args.model, prompt, max_tokens, &results)?;
     write_plot(&args.output_dir, &results)?;
     Ok(())
 }
 
-async fn warmup(base_url: &str, prompt: &str, max_tokens: usize) -> Result<()> {
-    let client = Client::new();
-    let _stats = one_streaming_request(&client, base_url, prompt, max_tokens, 7).await?;
+fn bench_client() -> Result<Client> {
+    Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .context("building benchmark HTTP client")
+}
+
+async fn warmup(
+    client: &Client,
+    base_url: &str,
+    model: &str,
+    prompt: &str,
+    max_tokens: usize,
+) -> Result<()> {
+    let _stats = one_streaming_request(client, base_url, model, prompt, max_tokens, 7).await?;
     Ok(())
 }
 
 async fn run_concurrency(
+    client: &Client,
     base_url: &str,
+    model: &str,
     mode: ServeMode,
     concurrency: usize,
     prompt: &str,
     max_tokens: usize,
 ) -> Result<RunResult> {
-    let client = Client::new();
     let barrier = std::sync::Arc::new(Barrier::new(concurrency + 1));
     let mut joins = Vec::with_capacity(concurrency);
     for index in 0..concurrency {
         let barrier = barrier.clone();
         let client = client.clone();
         let base_url = base_url.to_string();
+        let model = model.to_string();
         let prompt = prompt.to_string();
         joins.push(tokio::spawn(async move {
             barrier.wait().await;
-            one_streaming_request(&client, &base_url, &prompt, max_tokens, index as u64).await
+            one_streaming_request(
+                &client,
+                &base_url,
+                &model,
+                &prompt,
+                max_tokens,
+                index as u64,
+            )
+            .await
         }));
     }
     let start = Instant::now();
@@ -152,6 +187,7 @@ async fn run_concurrency(
 async fn one_streaming_request(
     client: &Client,
     base_url: &str,
+    model: &str,
     prompt: &str,
     max_tokens: usize,
     seed: u64,
@@ -161,7 +197,7 @@ async fn one_streaming_request(
     let response = client
         .post(url)
         .json(&json!({
-            "model": "gpt2",
+            "model": model,
             "prompt": prompt,
             "max_tokens": max_tokens,
             "stream": true,
@@ -178,15 +214,16 @@ async fn one_streaming_request(
     }
 
     let mut stream = response.bytes_stream();
-    let mut buffer = String::new();
+    let mut buffer = BytesMut::new();
     let mut stats = RequestStats::default();
     let mut last_token_at: Option<Instant> = None;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.context("reading SSE chunk")?;
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(frame_end) = buffer.find("\n\n") {
-            let frame = buffer[..frame_end].to_string();
-            buffer = buffer[frame_end + 2..].to_string();
+        buffer.extend_from_slice(&chunk);
+        while let Some((frame_end, delimiter_len)) = sse_frame_boundary(&buffer) {
+            let frame = buffer.split_to(frame_end);
+            buffer.advance(delimiter_len);
+            let frame = std::str::from_utf8(&frame).context("SSE frame was not UTF-8")?;
             for line in frame.lines() {
                 let Some(data) = line.strip_prefix("data:") else {
                     continue;
@@ -202,22 +239,17 @@ async fn one_streaming_request(
                 };
                 if !choice
                     .get("finish_reason")
-                    .map(|reason| reason.is_null())
-                    .unwrap_or(false)
+                    .is_some_and(|reason| reason.is_null())
                 {
                     continue;
                 }
-                let text = choice
-                    .get("text")
-                    .and_then(|text| text.as_str())
-                    .or_else(|| {
-                        choice
-                            .get("delta")
-                            .and_then(|delta| delta.get("content"))
-                            .and_then(|content| content.as_str())
-                    })
-                    .unwrap_or("");
-                if text.is_empty() {
+                let has_token_payload = choice.get("text").and_then(|text| text.as_str()).is_some()
+                    || choice
+                        .get("delta")
+                        .and_then(|delta| delta.get("content"))
+                        .and_then(|content| content.as_str())
+                        .is_some();
+                if !has_token_payload {
                     continue;
                 }
                 let now = Instant::now();
@@ -235,7 +267,19 @@ async fn one_streaming_request(
             }
         }
     }
-    Ok(stats)
+    Err(anyhow!("SSE stream ended before the [DONE] marker"))
+}
+
+fn sse_frame_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
+    for index in 0..buffer.len() {
+        if buffer[index..].starts_with(b"\r\n\r\n") {
+            return Some((index, 4));
+        }
+        if buffer[index..].starts_with(b"\n\n") {
+            return Some((index, 2));
+        }
+    }
+    None
 }
 
 fn percentile(mut values: Vec<f64>, p: f64) -> f64 {
@@ -249,6 +293,7 @@ fn percentile(mut values: Vec<f64>, p: f64) -> f64 {
 
 fn write_markdown(
     output_dir: &Path,
+    model: &str,
     prompt: &str,
     max_tokens: usize,
     results: &[RunResult],
@@ -256,6 +301,7 @@ fn write_markdown(
     let mut markdown = String::new();
     markdown.push_str("# Hotbatch Benchmark Results\n\n");
     markdown.push_str(&format!("Hardware: {}\n\n", hardware_spec()));
+    markdown.push_str(&format!("Model: `{model}`\n\n"));
     markdown.push_str(&format!(
         "Prompt: `{}`\n\nMax tokens: `{}`. Warm-up request excluded. Each measured client uses `stream=true` and records first-token and inter-token latency from SSE frame arrival times.\n\n",
         prompt, max_tokens
@@ -278,6 +324,12 @@ fn write_markdown(
 }
 
 fn write_plot(output_dir: &Path, results: &[RunResult]) -> Result<()> {
+    plotters::style::register_font(
+        "sans-serif",
+        plotters::style::FontStyle::Normal,
+        dejavu::sans::regular(),
+    )
+    .map_err(|_| anyhow!("embedded DejaVu Sans font is invalid"))?;
     let path = output_dir.join("results.png");
     let path_string = path.to_string_lossy().to_string();
     let root = BitMapBackend::new(&path_string, (960, 540)).into_drawing_area();

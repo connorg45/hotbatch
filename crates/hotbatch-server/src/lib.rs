@@ -3,16 +3,17 @@ pub mod metrics;
 pub mod naive;
 pub mod sse;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use axum::routing::{get, post};
 use axum::Router;
 use clap::{Args, ValueEnum};
+use hotbatch_core::model::normalize_model_name;
 use hotbatch_core::{
     ModelOptions, RequestQueue, Scheduler, SchedulerConfig, SchedulerMetrics, SlabKvCache,
     SmallTransformer, TokenizerBundle,
 };
 use naive::NaiveEngine;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -46,10 +47,53 @@ pub struct ServeArgs {
     pub max_seq_len: usize,
     #[arg(long, default_value_t = 64)]
     pub max_new_tokens: usize,
-    #[arg(long, default_value_t = 1200)]
-    pub forward_base_us: u64,
-    #[arg(long, default_value_t = 130)]
-    pub forward_per_seq_us: u64,
+}
+
+impl ServeArgs {
+    /// Validate all inexpensive startup configuration before loading model files or
+    /// opening a listening socket.
+    pub fn validate(&self) -> Result<()> {
+        if self.max_running_seqs == 0 {
+            bail!("--max-running-seqs must be greater than zero");
+        }
+        if self.max_queue_depth == 0 {
+            bail!("--max-queue-depth must be greater than zero");
+        }
+        if self.max_seq_len == 0 {
+            bail!("--max-seq-len must be greater than zero");
+        }
+        if self.max_new_tokens == 0 {
+            bail!("--max-new-tokens must be greater than zero");
+        }
+        if self.max_new_tokens >= self.max_seq_len {
+            bail!("--max-new-tokens must be less than --max-seq-len");
+        }
+        if self.max_seq_len > 1_024 {
+            bail!("--max-seq-len cannot exceed GPT-2's 1024-token context window");
+        }
+        let model_name = normalize_model_name(&self.model)?;
+        if model_name == "scripted" {
+            bail!("unsupported model 'scripted'; hotbatch serves GPT-2 models only");
+        }
+        if self.device != "cpu" {
+            bail!(
+                "unsupported device '{}'; hotbatch supports cpu only",
+                self.device
+            );
+        }
+        self.host
+            .parse::<IpAddr>()
+            .with_context(|| format!("invalid --host '{}': expected an IP address", self.host))?;
+        Ok(())
+    }
+
+    fn bind_addr(&self) -> Result<SocketAddr> {
+        let host = self
+            .host
+            .parse::<IpAddr>()
+            .with_context(|| format!("invalid --host '{}': expected an IP address", self.host))?;
+        Ok(SocketAddr::new(host, self.port))
+    }
 }
 
 #[derive(Clone)]
@@ -65,6 +109,8 @@ pub struct AppState {
     pub model_name: String,
     pub metrics: SchedulerMetrics,
     pub alive: Arc<AtomicBool>,
+    pub max_new_tokens: usize,
+    pub max_seq_len: usize,
 }
 
 pub struct BuiltApp {
@@ -94,15 +140,20 @@ pub fn init_tracing() {
 }
 
 pub async fn build_app(args: ServeArgs) -> Result<BuiltApp> {
+    args.validate()?;
     let metrics = SchedulerMetrics::new()?;
     let model_options = ModelOptions {
         model: args.model.clone(),
         device: args.device.clone(),
-        forward_base_us: args.forward_base_us,
-        forward_per_seq_us: args.forward_per_seq_us,
-        prefill_per_token_us: 50,
+        ..ModelOptions::default()
     };
     let model = SmallTransformer::load(model_options).await?;
+    if args.max_seq_len > model.max_positions() {
+        bail!(
+            "--max-seq-len cannot exceed the loaded model's {}-token context window",
+            model.max_positions()
+        );
+    }
     let tokenizer = model.tokenizer();
     let model_name = tokenizer.model_name().to_string();
     let shutdown = CancellationToken::new();
@@ -143,7 +194,21 @@ pub async fn build_app(args: ServeArgs) -> Result<BuiltApp> {
             });
             Engine::Continuous { queue }
         }
-        ServeMode::Naive => Engine::Naive(NaiveEngine::new(model, metrics.clone())),
+        ServeMode::Naive => {
+            let engine = NaiveEngine::new(
+                model,
+                metrics.clone(),
+                shutdown.clone(),
+                args.max_queue_depth,
+            );
+            let naive_shutdown = shutdown.clone();
+            let naive_alive = alive.clone();
+            tokio::spawn(async move {
+                naive_shutdown.cancelled().await;
+                naive_alive.store(false, Ordering::SeqCst);
+            });
+            Engine::Naive(engine)
+        }
     };
 
     let state = AppState {
@@ -152,6 +217,8 @@ pub async fn build_app(args: ServeArgs) -> Result<BuiltApp> {
         model_name,
         metrics: metrics.clone(),
         alive,
+        max_new_tokens: args.max_new_tokens,
+        max_seq_len: args.max_seq_len,
     };
 
     let router = Router::new()
@@ -170,14 +237,16 @@ pub async fn build_app(args: ServeArgs) -> Result<BuiltApp> {
 }
 
 pub async fn spawn_server(args: ServeArgs) -> Result<RunningServer> {
-    let bind = format!("{}:{}", args.host, args.port);
-    let listener = TcpListener::bind(&bind)
+    args.validate()?;
+    let bind = args.bind_addr()?;
+    let listener = TcpListener::bind(bind)
         .await
         .with_context(|| format!("binding {bind}"))?;
     spawn_on_listener(args, listener).await
 }
 
 pub async fn spawn_on_listener(args: ServeArgs, listener: TcpListener) -> Result<RunningServer> {
+    args.validate()?;
     let addr = listener.local_addr().context("reading listener address")?;
     let built = build_app(args).await?;
     let shutdown = built.shutdown.clone();
@@ -199,8 +268,9 @@ pub async fn spawn_on_listener(args: ServeArgs, listener: TcpListener) -> Result
 }
 
 pub async fn serve(args: ServeArgs) -> Result<()> {
-    let bind = format!("{}:{}", args.host, args.port);
-    let listener = TcpListener::bind(&bind)
+    args.validate()?;
+    let bind = args.bind_addr()?;
+    let listener = TcpListener::bind(bind)
         .await
         .with_context(|| format!("binding {bind}"))?;
     let addr = listener.local_addr().context("reading listener address")?;

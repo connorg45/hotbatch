@@ -4,7 +4,7 @@ Hotbatch is a Rust inference server that runs GPT-2 with [Candle](https://github
 
 ## Benchmark
 
-On an Apple M4 CPU with GPT-2 small, continuous batching produced **400.49 aggregate tokens/s at 32 concurrent requests**, compared with **72.51 tokens/s** for request-per-batch serving—a **5.52x throughput improvement**.
+On an Apple M4 CPU with GPT-2 small, continuous batching produced **420.28 aggregate tokens/s at 32 concurrent requests**, compared with **81.11 tokens/s** for request-per-batch serving—a **5.18x throughput improvement**.
 
 The benchmark used the same host and model for both modes, generated 64 tokens per streamed request with deterministic sampling, excluded one warm-up request per mode, and measured token arrival times from SSE frames. The complete table and methodology are in [the benchmark results](bench/results.md).
 
@@ -64,15 +64,15 @@ curl -N http://localhost:8080/v1/completions \
 Run the checks and benchmark with:
 
 ```bash
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test --release --all
-cargo run --release -- bench
+cargo fmt --all --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --release --all
+cargo run --locked --release -- bench
 ```
 
 ## Limitations
 
-- Inference is optimized for GPT-2 small on CPU; no GPU execution path is included in the default build.
+- Inference is limited to GPT-2-family models on CPU; no GPU execution path is included.
 - The KV cache uses one fixed slot per active sequence rather than paged allocation or prefix sharing.
 - The API implements a practical subset of the OpenAI schema, not every request field or response feature.
 - Chat messages are rendered into a plain GPT-2 prompt; GPT-2 is not instruction-tuned.
