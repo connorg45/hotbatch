@@ -1,0 +1,25 @@
+name: hotbatch
+
+services:
+  hotbatch:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      RUST_LOG: info
+    volumes:
+      - hotbatch-hf-cache:/root/.cache/huggingface
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - hotbatch
+
+volumes:
+  hotbatch-hf-cache:

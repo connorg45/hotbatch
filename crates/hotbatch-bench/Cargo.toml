@@ -1,0 +1,36 @@
+[package]
+name = "hotbatch-bench"
+version.workspace = true
+edition.workspace = true
+description = "Benchmark harness for continuous and request-at-a-time Hotbatch inference."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "hotbatch-bench"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+hotbatch-server = { path = "../hotbatch-server" }
+plotters.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[features]
+default = []
+cuda = ["hotbatch-server/cuda"]
+tch = ["hotbatch-server/tch"]
