@@ -45,6 +45,8 @@ Both completion endpoints accept deterministic seeds, sampling controls, stop se
 
 ## Build and run
 
+Prerequisites: Rust 1.89 or newer and a C/C++ build toolchain. The commands below run the server on `127.0.0.1:8080` by default.
+
 The first model-backed command downloads GPT-2 tokenizer, configuration, and weight files from Hugging Face and stores them in the local cache.
 
 ```bash
@@ -70,6 +72,12 @@ cargo test --locked --release --all
 cargo run --locked --release -- bench
 ```
 
+## Deployment and security
+
+The HTTP API does not implement authentication or per-client rate limiting. Keep the default loopback bind for local use. If the server is exposed beyond a trusted network, place it behind a gateway that provides authentication, request throttling, and TLS. Queue depth, sequence length, and generation length are bounded through the `serve` options.
+
+The Docker image runs as an unprivileged user, and the Compose service drops Linux capabilities and enables a read-only root filesystem. See [SECURITY.md](SECURITY.md) for private vulnerability reporting and the supported release policy.
+
 ## Limitations
 
 - Inference is limited to GPT-2-family models on CPU; no GPU execution path is included.
@@ -77,6 +85,10 @@ cargo run --locked --release -- bench
 - The API implements a practical subset of the OpenAI schema, not every request field or response feature.
 - Chat messages are rendered into a plain GPT-2 prompt; GPT-2 is not instruction-tuned.
 - The benchmark reports one Apple M4 system and should not be generalized to other hardware or workloads.
+
+## Contributing and license
+
+Development setup and pull request checks are documented in [CONTRIBUTING.md](CONTRIBUTING.md). Hotbatch is available under the [MIT License](LICENSE).
 
 ## References
 

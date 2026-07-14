@@ -29,7 +29,7 @@ pub enum ServeMode {
 
 #[derive(Debug, Clone, Args)]
 pub struct ServeArgs {
-    #[arg(long, default_value = "0.0.0.0")]
+    #[arg(long, default_value = "127.0.0.1")]
     pub host: String,
     #[arg(long, default_value_t = 8080)]
     pub port: u16,
